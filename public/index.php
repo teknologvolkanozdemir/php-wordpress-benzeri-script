@@ -57,7 +57,7 @@ function layout(string $title, string $content, array $settings = [], bool $admi
     echo '<title>' . h($title) . ' - ' . h($siteTitle) . '</title>';
     echo '<meta name="description" content="' . h($seoDescription) . '"><meta name="keywords" content="' . h($keywords) . '">';
     if ($themeCss !== '') {
-        echo '<style>' . str_replace('</style', '<\/style', $themeCss) . '</style>';
+        echo '<style>' . preg_replace('~</style~i', '<\\/style', $themeCss) . '</style>';
     } else {
         echo '<style>
             :root{font-family:system-ui,sans-serif;color:#202532;background:#f4f6fa}*{box-sizing:border-box}
@@ -78,6 +78,9 @@ function layout(string $title, string $content, array $settings = [], bool $admi
         echo '<img class="logo" src="/media/' . rawurlencode(basename($logo)) . '" alt="' . h($siteTitle) . '">';
     }
     echo '<strong>' . h($siteTitle) . '</strong></a><nav><a href="/">Ana Sayfa</a><a href="/ara">Ara</a>';
+    foreach ($GLOBALS['publicCategories'] ?? [] as $category) {
+        echo '<a href="/kategori/' . rawurlencode($category['slug']) . '">' . h($category['name']) . '</a>';
+    }
     if ($admin) {
         echo '<a href="' . h($settings['admin_path'] ?? '/yonetim') . '">Yönetim</a>';
     }
@@ -91,7 +94,13 @@ function field(string $label, string $name, string $value = '', string $type = '
 
 function dbConnect(array $config): PDO
 {
-    $dsn = sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $config['host'], $config['port'] ?? '3306', $config['database']);
+    $host = (string) ($config['host'] ?? '');
+    $port = (string) ($config['port'] ?? '3306');
+    $database = (string) ($config['database'] ?? '');
+    if (!preg_match('/^[a-zA-Z0-9._:-]+$/', $host) || !ctype_digit($port) || (int) $port < 1 || (int) $port > 65535 || !preg_match('/^[a-zA-Z0-9_]+$/', $database)) {
+        throw new RuntimeException('MySQL sunucusu, portu veya veritabanı adı geçersiz.');
+    }
+    $dsn = sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $host, $port, $database);
     return new PDO($dsn, $config['username'], $config['password'], [
         PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
@@ -105,7 +114,7 @@ function installSchema(PDO $db): void
         'CREATE TABLE IF NOT EXISTS users (id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, username VARCHAR(100) NOT NULL UNIQUE, password_hash VARCHAR(255) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
         'CREATE TABLE IF NOT EXISTS settings (`key` VARCHAR(100) PRIMARY KEY, value TEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
         'CREATE TABLE IF NOT EXISTS categories (id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, name VARCHAR(190) NOT NULL, slug VARCHAR(190) NOT NULL UNIQUE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
-        'CREATE TABLE IF NOT EXISTS posts (id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, category_id INT UNSIGNED NOT NULL, title VARCHAR(255) NOT NULL, slug VARCHAR(255) NOT NULL UNIQUE, content MEDIUMTEXT NOT NULL, status VARCHAR(20) NOT NULL DEFAULT "draft", created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, CONSTRAINT posts_category_fk FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE RESTRICT, INDEX posts_status_created (status, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
+        "CREATE TABLE IF NOT EXISTS posts (id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, category_id INT UNSIGNED NOT NULL, title VARCHAR(255) NOT NULL, slug VARCHAR(255) NOT NULL UNIQUE, content MEDIUMTEXT NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'draft', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, CONSTRAINT posts_category_fk FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE RESTRICT, INDEX posts_status_created (status, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
         'CREATE TABLE IF NOT EXISTS forms (id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, name VARCHAR(190) NOT NULL, fields_json TEXT NOT NULL, post_id INT UNSIGNED NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT forms_post_fk FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
         'CREATE TABLE IF NOT EXISTS messages (id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, form_id INT UNSIGNED NOT NULL, post_id INT UNSIGNED NULL, values_json MEDIUMTEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT messages_form_fk FOREIGN KEY (form_id) REFERENCES forms(id) ON DELETE CASCADE, CONSTRAINT messages_post_fk FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
         'CREATE TABLE IF NOT EXISTS polls (id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, name VARCHAR(190) NOT NULL, question VARCHAR(500) NOT NULL, options_json TEXT NOT NULL, post_id INT UNSIGNED NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT polls_post_fk FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
@@ -165,13 +174,27 @@ function packageUpload(PDO $db, string $type, string $storage): string
         throw new RuntimeException('ZIP dosyası okunamadı.');
     }
     $rootName = '';
+    $entries = [];
+    $totalSize = 0;
     for ($i = 0; $i < $zip->numFiles; $i++) {
         $entry = $zip->getNameIndex($i);
-        if ($entry === false || str_contains($entry, "\0") || str_starts_with($entry, '/') || preg_match('~(^|/)\.\.(/|$)~', $entry)) {
+        $stat = $zip->statIndex($i);
+        $system = 0;
+        $attributes = 0;
+        $zip->getExternalAttributesIndex($i, $system, $attributes);
+        $entryPath = str_replace('\\', '/', (string) $entry);
+        $unixType = (((int) $attributes >> 16) & 0170000);
+        if ($entry === false || $stat === false || str_contains($entryPath, "\0") || str_starts_with($entryPath, '/') || preg_match('/^[a-zA-Z]:/', $entryPath) || preg_match('~(^|/)\.\.(/|$)~', $entryPath) || ($system === ZipArchive::OPSYS_UNIX && $unixType === 0120000)) {
             $zip->close();
             throw new RuntimeException('Güvenli olmayan ZIP yolu.');
         }
-        $first = explode('/', trim($entry, '/'))[0] ?? '';
+        $totalSize += (int) $stat['size'];
+        if ($totalSize > 50 * 1024 * 1024 || $zip->numFiles > 2000) {
+            $zip->close();
+            throw new RuntimeException('Paket açılmış halde 50 MB veya 2.000 dosya sınırını aşamaz.');
+        }
+        $entries[] = [$entry, $entryPath, $stat];
+        $first = explode('/', trim($entryPath, '/'))[0] ?? '';
         if ($first !== '') {
             $rootName = $first;
         }
@@ -186,9 +209,34 @@ function packageUpload(PDO $db, string $type, string $storage): string
         $zip->close();
         throw new RuntimeException('Paket dizini oluşturulamadı.');
     }
-    if (!$zip->extractTo($target)) {
-        $zip->close();
-        throw new RuntimeException('Paket açılamadı.');
+    foreach ($entries as [$originalPath, $entryPath, $stat]) {
+        $destination = $target . '/' . $entryPath;
+        if (str_ends_with($entryPath, '/')) {
+            if (!is_dir($destination) && !mkdir($destination, 0750, true)) {
+                $zip->close();
+                throw new RuntimeException('Paket dizini oluşturulamadı.');
+            }
+            continue;
+        }
+        $parent = dirname($destination);
+        if (!is_dir($parent) && !mkdir($parent, 0750, true)) {
+            $zip->close();
+            throw new RuntimeException('Paket dizini oluşturulamadı.');
+        }
+        $source = $zip->getStream($originalPath);
+        if ($source === false) {
+            $zip->close();
+            throw new RuntimeException('Paket dosyası okunamadı.');
+        }
+        $output = fopen($destination, 'wb');
+        if ($output === false) {
+            fclose($source);
+            $zip->close();
+            throw new RuntimeException('Paket dosyası yazılamadı.');
+        }
+        stream_copy_to_stream($source, $output, (int) $stat['size']);
+        fclose($source);
+        fclose($output);
     }
     $zip->close();
     $metadata = '';
@@ -268,6 +316,7 @@ try {
     exit('MySQL bağlantısı kurulamadı. storage/config.php ayarlarını kontrol edin.');
 }
 $settings = settings($db);
+$GLOBALS['publicCategories'] = tableRows($db, 'SELECT name,slug FROM categories ORDER BY name');
 $adminUrl = adminPath($settings);
 $GLOBALS['adminUrl'] = $adminUrl;
 $uriPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
@@ -411,7 +460,7 @@ if ($isAdmin) {
                         throw new RuntimeException('Logo 3 MB altında olmalı.');
                     }
                     $mime = mime_content_type($_FILES['logo']['tmp_name']);
-                    $extensions = ['image/png' => 'png', 'image/jpeg' => 'jpg', 'image/gif' => 'gif', 'image/webp' => 'webp', 'image/svg+xml' => 'svg'];
+                    $extensions = ['image/png' => 'png', 'image/jpeg' => 'jpg', 'image/gif' => 'gif', 'image/webp' => 'webp'];
                     if (!isset($extensions[$mime])) {
                         throw new RuntimeException('Logo PNG, JPG, GIF, WEBP veya SVG olmalı.');
                     }
@@ -441,7 +490,9 @@ if ($isAdmin) {
                 $extension->execute([$id]);
                 $item = $extension->fetch();
                 if ($item) {
-                    $db->prepare('UPDATE extensions SET active=0 WHERE type=?')->execute([$item['type']]);
+                    if ($item['type'] === 'theme') {
+                        $db->prepare('UPDATE extensions SET active=0 WHERE type=?')->execute([$item['type']]);
+                    }
                     $db->prepare('UPDATE extensions SET active=1 WHERE id=?')->execute([$id]);
                     if ($item['type'] === 'theme') {
                         $row = $db->prepare('SELECT directory FROM extensions WHERE id=?');
@@ -462,7 +513,14 @@ if ($isAdmin) {
                 }
                 $view = 'extensions';
             } elseif ($action === 'extension_disable') {
+                $extension = $db->prepare('SELECT type FROM extensions WHERE id=?');
+                $extension->execute([(int) $_POST['id']]);
+                $type = $extension->fetchColumn();
                 $db->prepare('UPDATE extensions SET active=0 WHERE id=?')->execute([(int) $_POST['id']]);
+                if ($type === 'theme') {
+                    saveSettings($db, ['theme_css' => '']);
+                    $settings['theme_css'] = '';
+                }
                 $notice = 'Tema/eklenti devre dışı bırakıldı.';
                 $view = 'extensions';
             } elseif ($action === 'extension_delete') {
@@ -533,8 +591,8 @@ if ($isAdmin) {
         }
         $content .= '</select></label><label>İçerik<textarea name="content" required>' . h($edit['content'] ?? '') . '</textarea></label><label>Durum<select name="status"><option value="draft">Taslak</option><option value="published"' . (($edit['status'] ?? '') === 'published' ? ' selected' : '') . '>Yayımla</option></select></label><button>Yazıyı kaydet</button></form>';
         $content .= '<h2>Yazılar</h2><table><tr><th>Başlık</th><th>Kategori</th><th>Durum</th><th>İşlem</th></tr>';
-        foreach (tableRows($db, 'SELECT p.id,p.title,p.status,c.name category FROM posts p JOIN categories c ON c.id=p.category_id ORDER BY p.created_at DESC') as $post) {
-            $content .= '<tr><td>' . h($post['title']) . '</td><td>' . h($post['category']) . '</td><td>' . h($post['status']) . '</td><td><a href="' . h($adminUrl) . '?view=posts&edit=' . (int) $post['id'] . '">Düzenle</a> <a href="/yazi/' . rawurlencode($post['slug'] ?? '') . '">Gör</a><form method="post">' . csrf() . '<input type="hidden" name="action" value="delete_post"><input type="hidden" name="id" value="' . (int) $post['id'] . '"><button>Sil</button></form></td></tr>';
+        foreach (tableRows($db, 'SELECT p.id,p.title,p.slug,p.status,c.name category FROM posts p JOIN categories c ON c.id=p.category_id ORDER BY p.created_at DESC') as $post) {
+            $content .= '<tr><td>' . h($post['title']) . '</td><td>' . h($post['category']) . '</td><td>' . h($post['status']) . '</td><td><a href="' . h($adminUrl) . '?view=posts&edit=' . (int) $post['id'] . '">Düzenle</a> <a href="/yazi/' . rawurlencode($post['slug']) . '">Gör</a><form method="post">' . csrf() . '<input type="hidden" name="action" value="delete_post"><input type="hidden" name="id" value="' . (int) $post['id'] . '"><button>Sil</button></form></td></tr>';
         }
         $content .= '</table>';
     } elseif ($view === 'forms') {
@@ -596,7 +654,7 @@ if ($isAdmin) {
                     if ($heading === 'Yazılar') {
                         $query->execute(['/yazi/', $like, $like]);
                     } elseif ($heading === 'Anketler') {
-                        $query->execute([$like, $like]);
+                        $query->execute(['#', $like, $like]);
                     } else {
                         $query->execute(['#', $like]);
                     }
@@ -673,6 +731,21 @@ if ($uriPath === '/ara') {
         $statement->execute(['%' . $query . '%', '%' . $query . '%']);
         foreach ($statement as $row) {
             $content .= '<article class="card"><h2><a href="/yazi/' . rawurlencode($row['slug']) . '">' . h($row['title']) . '</a></h2><p class="muted">' . h($row['category']) . '</p></article>';
+        }
+    }
+} elseif (preg_match('~^/kategori/([a-z0-9-]+)$~', $uriPath, $match)) {
+    $category = $db->prepare('SELECT name FROM categories WHERE slug=?');
+    $category->execute([$match[1]]);
+    $categoryName = $category->fetchColumn();
+    if ($categoryName === false) {
+        http_response_code(404);
+        $content = '<h1>Kategori bulunamadı</h1>';
+    } else {
+        $content = '<h1>' . h($categoryName) . '</h1>';
+        $posts = $db->prepare("SELECT p.title,p.slug,p.content,p.created_at FROM posts p JOIN categories c ON c.id=p.category_id WHERE p.status='published' AND c.slug=? ORDER BY p.created_at DESC");
+        $posts->execute([$match[1]]);
+        foreach ($posts as $post) {
+            $content .= '<article class="card"><p class="muted">' . h($post['created_at']) . '</p><h2><a href="/yazi/' . rawurlencode($post['slug']) . '">' . h($post['title']) . '</a></h2><p>' . h(mb_substr($post['content'], 0, 240, 'UTF-8')) . '</p></article>';
         }
     }
 } elseif (preg_match('~^/yazi/([a-z0-9-]+)$~', $uriPath, $match)) {
